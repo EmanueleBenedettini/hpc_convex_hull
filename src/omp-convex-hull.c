@@ -215,39 +215,6 @@ double cw_angle(const point_t p0, const point_t p1, const point_t p2)
 	return result;
 }
 
-/**
- * Swaps two points
- */
-void swap_points(point_t* p0, point_t* p1) {
-	if (p0->x != p1->x || p0->y != p1->y) {
-		point_t p;
-		p.x = p1->x;
-		p.y = p1->y;
-		p1->x = p0->x;
-		p1->y = p0->y;
-		p0->x = p.x;
-		p0->y = p.y;
-	}
-}
-
-
-/**
- * Reduction function
- * values and lenght, point array, last 2 point of hull
- */
-int reduction(int* vals, int lenght, point_t* p, int cur, point_t* last, point_t* scnd_last){
-	int res = vals[0];
-	double minAngle = 2*M_PI; //Greater than 180 degree = pi
-    for (int i = 0; i < lenght; i++) {
-		double angle = cw_angle(*scnd_last, *last, p[vals[i]]);	//i punti non sono giusti
-		if ((angle < minAngle) && (vals[i] != cur)) {
-			minAngle = angle;
-			res = vals[i];
-		}
-	}
-	return res;
-}
-
 
 /**
  * Compute the convex hull of all points in pset using the "Gift
@@ -258,7 +225,7 @@ void convex_hull(const points_t *pset, points_t *hull)
 {
     const int n = pset->n;
     point_t *p = pset->p;
-    point_t fakePoint;
+    point_t fakePoint, *last, *scnd_last;
     int i, j, running_condition;
     int cur, next, leftmost;
 
@@ -274,9 +241,6 @@ void convex_hull(const points_t *pset, points_t *hull)
             leftmost = i;
         }
     }
-	/*
-	swap_points(&p[leftmost], &p[n-1]);
-	leftmost = n-1;*/
     cur = leftmost;
 
     fakePoint.x = p[leftmost].x;		//
@@ -284,13 +248,18 @@ void convex_hull(const points_t *pset, points_t *hull)
 
 	const int thread_count = omp_get_max_threads();
     fprintf(stderr, "Thread count = %d\n", thread_count);
+	
 	int tmpRes[thread_count];
+	double tmpAngles[thread_count];
 
+	//thees two variables are used during reduction.
+	last = &hull->p[hull->n-1];
+	scnd_last = &fakePoint;
 
 /* Main loop of the Gift Wrapping algorithm. This is where most of
        the time is spent; therefore, this is the block of code that
        must be parallelized. */
-#pragma omp parallel private(j) shared(cur, p, tmpRes, next, hull, leftmost, fakePoint, running_condition) default(none)
+#pragma omp parallel private(j) shared(cur, p, tmpRes, tmpAngles, next, last, scnd_last, hull, leftmost, fakePoint, running_condition) default(none)
 {    
 	const int my_rank = omp_get_thread_num();
     do {
@@ -301,12 +270,12 @@ void convex_hull(const points_t *pset, points_t *hull)
         hull->p[hull->n] = p[cur];
         hull->n++;
 
-        /* Search for the next vertex */
-        //next = (cur + 1) % n;
+        /* Update the next vertex */
 		next++;
+
 }
 #pragma omp barrier
-		tmpRes[my_rank] = next;	//every thread updates his own next
+		tmpRes[my_rank] = next;	//every thread updates his own next to default one
 
 #pragma omp for schedule(static)
         for (j=0; j<n; j++) {
@@ -314,24 +283,31 @@ void convex_hull(const points_t *pset, points_t *hull)
                 tmpRes[my_rank] = j;
             }
         }
+
+		//once a thread has finished his part of the cycle
+		tmpAngles[my_rank] = cw_angle(*scnd_last, *last, p[tmpRes[my_rank]]);
+
 #pragma omp barrier
 #pragma omp master
 {		
-		//extract the best suitable point from the array cotaining all of the threads best solutions
-		if(hull->n-2 >= 0){
-			next = reduction(tmpRes, thread_count, p, cur, &hull->p[hull->n-1], &hull->p[hull->n-2]);
-		}else{
-			next = reduction(tmpRes, thread_count, p, cur, &hull->p[hull->n-1], &fakePoint);
+		//extract the best suitable point from the arrays cotaining all of the threads best solutions
+		next = tmpRes[0];
+		double next_angle = tmpAngles[0];
+		for(j=1; j<thread_count; j++){
+			if(tmpAngles[j] < next_angle ){
+				next = tmpRes[j];
+				next_angle = tmpAngles[j]; 
+			}
 		}
+
 		assert(cur != next); //if equals I'm stuck
         cur = next;
 		running_condition = (cur != leftmost);
 
-		/*this section moves points found to the beginning of the point array
-			so we can decrease the computational complexity in worst case scenario */
-		/*swap_points(&p[cur], &p[hull->n-1]);
-		next = hull->n-1;
-		cur = next;*/
+		//thees two variables are used during reduction.
+		last = &hull->p[hull->n-1];
+		scnd_last = &hull->p[hull->n-2];
+
 }
 #pragma omp barrier
     } while (running_condition);
