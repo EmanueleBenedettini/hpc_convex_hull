@@ -62,6 +62,10 @@
 
 #define BLKDIM 1024
 
+//#define NO_CUDA_CHECK_ERROR //enable this during evaluation (removes some overhead)
+
+#define DEBUG   //this enables debug prints on stderr
+
 /* A single point */
 typedef struct {
     double x, y;
@@ -159,6 +163,12 @@ void write_hull( FILE *f, const points_t *hull )
     fprintf(f, "%f %f\n", hull->p[0].x, hull->p[0].y);    
 }
 
+void print_debug_statements(const char* str ){
+#ifdef DEBUG
+    fprintf(stderr, "%s", str);
+#endif
+}
+
 /**
  * Return LEFT, RIGHT or COLLINEAR depending on the shape
  * of the vectors p0p1 and p1p2
@@ -230,7 +240,6 @@ __host__ __device__ double cw_angle(const point_t p0, const point_t p1, const po
  *	Compute the angle between p1, p2 and p3 and generate cuda_point_p data
  */
 __device__ cuda_point_t compute_angle( const point_t p1, const point_t p2, const point_t p3, unsigned int p3_Id) {
-	//const int i = threadIdx.x + blockIdx.x * blockDim.x;
 	cuda_point_t p;
 	p.p = p3;
 	p.a = cw_angle(p1, p2, p3);
@@ -252,6 +261,33 @@ __device__ cuda_point_t minAngle(cuda_point_t p1, cuda_point_t p2) {
 
 //------------------------------------------------------------------------------------------------------------------------------------
 //------------------------------------------------------------------------------------------------------------------------------------
+
+/*
+ * This kernel is used to populate the data structure. Should be called whit a total thread count equals (or greater) than pset->n
+ */
+ __global__ void fill_data_structure(const points_t *pset, cuda_points_t *data_structure)
+ {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < pset->n){
+        data_structure->elem[i].p = pset->p[i];
+        data_structure->elem[i].id = i;
+    }
+    if (i == 0){
+        data_structure->n = pset->n;
+    }
+ }
+
+/*
+ * This kernel is used to retrieve the result in a simple way (removing addressing problems).
+ *
+ __global__ void ret_result( int *res, cuda_points_t *data_structure)
+ {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i == 0){
+        *res = data_structure->elem[0].id;
+    }
+ }*/
+
 /**
  *	Reduction functions. The source is an official sheet from nvidia developer site: https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf
  *	It has been modified to accomplish our goal
@@ -271,12 +307,12 @@ __device__ void warpReduce(volatile cuda_point_t sdata, unsigned int tid) {
 
 //main reduction
 template <unsigned int blockSize>
-__global__ void reduce(cuda_points_t* g_idata, cuda_points_t* g_odata, const int n, point_t prev, point_t cur) {
+__global__ void reduce(cuda_points_t* g_idata, cuda_points_t* g_odata, const int n, point_t prev, point_t cur) 
+{
 	extern __shared__ cuda_point_t sdata[];
 	unsigned int tid = threadIdx.x;
 	unsigned int i = blockIdx.x*(blockSize * 2) + tid;
 	unsigned int gridSize = blockSize * 2 * gridDim.x;
-	//sdata[tid] = 0;
 	
 	//each thread executes more than one angle operation
 	while (i < n) {
@@ -321,13 +357,16 @@ void convex_hull(const points_t *pset, points_t *hull)
 
 	int blocks = (n / BLKDIM) + 1;
 
-    cuda_points_t *d_in, *d_temp, *d_out, next_p;
-    point_t prev_p, cur_p, fakePoint;
+    cuda_points_t *d_in, *d_temp, *d_out;
+    cuda_point_t *in_elem, *temp_elem, *out_elem, *last_elem;
+    points_t *d_pset;
+    point_t prev_p, cur_p, fakePoint, *temp_set;
 
     hull->n = 0;
     /* There can be at most n points in the convex hull. At the end of
        this function we trim the excess space. */
-    hull->p = (point_t*)malloc(n * sizeof(*(hull->p))); assert(hull->p);
+    hull->p = (point_t*)malloc(n * sizeof(*(hull->p))); 
+    assert(hull->p);
     
     /* Identify the leftmost point p[leftmost] */
     leftmost = 0;
@@ -339,19 +378,41 @@ void convex_hull(const points_t *pset, points_t *hull)
     cur = leftmost;
 
     fakePoint.x = p[leftmost].x;		//
-	fakePoint.y = p[leftmost].y - 1;	// This point is used for the first reduction operation that we will encounter
+    fakePoint.y = p[leftmost].y - 1;	// This point is used for the first reduction operation that we will encounter
 
-	cudaSafeCall(cudaMalloc((void **)&d_in, sizeof(cuda_points_t)));
-	cudaSafeCall(cudaMalloc(&(d_in->elem), n * sizeof(point_t)));
+    //memory initialization
+    last_elem = (cuda_point_t*)malloc(sizeof(cuda_point_t));
 
-	cudaSafeCall(cudaMalloc((void **)&d_temp, sizeof(cuda_points_t)));
-	cudaSafeCall(cudaMalloc(&(d_temp->elem), blocks * sizeof(point_t)));
+    //fprintf(stderr, "debug point 1.1 - Memory allocation\n");
+    print_debug_statements("debug point 1.1 - Memory allocation\n");
+    cudaSafeCall(   cudaMalloc( (void **)&d_in,     sizeof(cuda_points_t))  );
+    cudaSafeCall(   cudaMalloc( (void **)&d_temp,   sizeof(cuda_points_t))  );
+    cudaSafeCall(   cudaMalloc( (void **)&d_out,    sizeof(cuda_points_t))  );
+    cudaSafeCall(   cudaMalloc( (void **)&d_pset,   sizeof(points_t))       );
 
-	cudaSafeCall(cudaMalloc((void **)&d_out, sizeof(cuda_points_t)));
-	cudaSafeCall(cudaMalloc(&(d_out->elem), sizeof(point_t)));
+    print_debug_statements("debug point 1.1.1\n");
+    cudaSafeCall(   cudaMalloc( (void **)&in_elem,    n * sizeof(cuda_point_t))   );
+    cudaSafeCall(   cudaMemcpy(&d_in->elem, &in_elem, sizeof(cuda_point_t*), cudaMemcpyHostToDevice)    );
+    
+    print_debug_statements("debug point 1.1.2\n");
+    cudaSafeCall(   cudaMalloc( (void **)&temp_elem,    blocks * sizeof(cuda_point_t))  );
+    cudaSafeCall(   cudaMemcpy(&d_temp->elem, &temp_elem, sizeof(cuda_point_t*), cudaMemcpyHostToDevice)  );
 
-	cudaSafeCall(cudaMemcpy(d_in->elem, p, n * sizeof(point_t), cudaMemcpyHostToDevice));
-	//cudaSafeCall(cudaMemcpy((d_in->n), n, sizeof(int), cudaMemcpyHostToDevice));
+    print_debug_statements("debug point 1.1.3\n");
+    cudaSafeCall(   cudaMalloc( (void **)&out_elem,   1 * sizeof(cuda_point_t))    );
+    cudaSafeCall(   cudaMemcpy(&d_out->elem, &out_elem, sizeof(cuda_point_t*), cudaMemcpyHostToDevice)   );
+
+    print_debug_statements("debug point 1.1.4\n");
+    cudaSafeCall(   cudaMalloc( (void **)&temp_set,   n * sizeof(point_t))  );
+    cudaSafeCall(   cudaMemcpy(temp_set, pset->p, n * sizeof(point_t), cudaMemcpyHostToDevice)  );
+    cudaSafeCall(   cudaMemcpy(&d_pset->p, &temp_set, sizeof(point_t*), cudaMemcpyHostToDevice)   );
+
+    cudaCheckError();
+
+    print_debug_statements("debug point 1.2 - Memory initialization\n");
+    fill_data_structure<<<blocks, BLKDIM>>>(pset, d_in);
+    print_debug_statements("debug point 1.2 - Memory initialization completed\n");
+
     
     /* Main loop of the Gift Wrapping algorithm. This is where most of
        the time is spent; therefore, this is the block of code that
@@ -362,6 +423,8 @@ void convex_hull(const points_t *pset, points_t *hull)
         hull->p[hull->n] = p[cur];
         hull->n++;
 
+        fprintf(stderr, "n. punti trovati: %d\n", hull->n);
+
         //gestire memoria
         if(hull->n > 1){
             prev_p = hull->p[hull->n-2];
@@ -371,22 +434,41 @@ void convex_hull(const points_t *pset, points_t *hull)
 
         cur_p = hull->p[hull->n-1];
 
-		reduce<BLKDIM> << <blocks, BLKDIM >> > (d_in, d_temp, n, prev_p, cur_p);
-		cudaDeviceSynchronize();
-		reduce<BLKDIM> << <1, blocks >> > (d_temp, d_out, n, prev_p, cur_p);
+        //QUA BISOGNA FARE UN CICLO PER RISOLVERE CAPO (dentro il kernel probabilmente)
+        fprintf(stderr, "%d\n", blocks);
+        assert(blocks < 1024);
 
-		cudaMemcpy(&next_p, d_out, sizeof(cuda_points_t), cudaMemcpyDeviceToHost);
-        next = next_p.elem[0].id;
-		//gestire memoria
+        //reduce<BLKDIM> <<<1, 1 >>> (d_in, d_temp, n, prev_p, cur_p);
+
+        print_debug_statements("debug point 2.1 - starting reduction\n");
+        reduce<BLKDIM> << <blocks, BLKDIM >> >  (d_in, d_temp, n, prev_p, cur_p);
+        cudaDeviceSynchronize();
+
+        print_debug_statements("debug point 2.2 - finalizing reduction\n");
+		reduce<BLKDIM> << <1, blocks >> >       (d_temp, d_out, n, prev_p, cur_p);
+
+        print_debug_statements("debug point 2.3 - get the result\n");
+        //cudaSafeCall(   cudaMemcpy(&next, &(out_elem->id), sizeof(int), cudaMemcpyDeviceToHost)    );
+        cudaSafeCall(   cudaMemcpy(last_elem, in_elem, sizeof(cuda_point_t), cudaMemcpyDeviceToHost)    );
+        cudaCheckError();
+
+        next = last_elem->id;
 
         assert(cur != next);
         cur = next;
     } while (cur != leftmost);
 
-	//Libero memoria nella gpu
+    //free of gpu memory allocation
+    print_debug_statements("debug point 3.1 - deallocation of memory\n");
+    cudaFree(in_elem);
+    cudaFree(temp_elem);
+    cudaFree(out_elem);
+    cudaFree(temp_set);
+
 	cudaFree(d_in);
 	cudaFree(d_temp);
-	cudaFree(d_out);
+    cudaFree(d_out);
+    cudaFree(d_pset);
     
     /* Trim the excess space in the convex hull array */
     hull->p = (point_t*)realloc(hull->p, (hull->n) * sizeof(*(hull->p)));
@@ -394,7 +476,7 @@ void convex_hull(const points_t *pset, points_t *hull)
 }
 
 /**
- * Compute the area ("volume", in qconvex terminoloty) of a convex
+ * Compute the area ("volume", in qconvex terminology) of a convex
  * polygon whose vertices are stored in pset using Gauss' area formula
  * (also known as the "shoelace formula"). See:
  *
