@@ -60,11 +60,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define BLKDIM 1024
+#define BLKDIM 1024 // number of threads per block. has to be multiple of 2, make sure it remains in thread limits caused by cuda compute capability
 
 //#define NO_CUDA_CHECK_ERROR //enable this during evaluation (removes some overhead)
-
-//#define DEBUG   //this enables debug prints on stderr
 
 /* A single point */
 typedef struct {
@@ -236,6 +234,15 @@ __host__ __device__ double cw_angle(const point_t p0, const point_t p1, const po
     return (result >= 0 ? result : 2*M_PI + result);
 }
 
+
+__device__ bool are_equals_p(const point_t p1, const point_t p2){
+    if ((p1.x == p2.x) && (p1.y == p2.y)){
+        return true;
+    } else {
+        return false;
+    }
+}
+
 /**
  *	Compute the angle between p1, p2 and p3 and generate cuda_point_p data
  */
@@ -244,10 +251,11 @@ __device__ cuda_point_t compute_angle( const point_t p1, const point_t p2, const
     p.p = p3;
     p.id = p3_Id;
 
-    if(p2.x != p3.x || p2.y != p3.y){
-	    p.a = cw_angle(p1, p2, p3);
+    //if(p2.x != p3.x || p2.y != p3.y){
+    if(are_equals_p(p1, p3) || are_equals_p(p2, p3)){
+        p.a = 2*M_PI+1;
     }else{
-        p.a = 2*M_PI;
+        p.a = cw_angle(p1, p2, p3);
     }
     return p;
 }
@@ -344,66 +352,91 @@ __global__ void reduce(cuda_points_t* g_idata, cuda_points_t* g_odata, const int
 	if(tid == 0) g_odata->elem[blockIdx.x] = sdata[0];	//array of result (each block return his best result)
 }*/
 
-
+/**
+ *  - used to reduce the elements assigned to one block
+ */
 __device__ void block_reduce(cuda_point_t *sdata, cuda_point_t *out, const unsigned int tid, const unsigned int blockSize){
-    //for each following lines, we have a reduction running whit log(n) threads
-	if ((blockSize >= 1024) && (tid < 512)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 512]);	__syncthreads(); } 
-	if ((blockSize >= 512) && (tid < 256))  { sdata[tid] = minAngle(sdata[tid], sdata[tid + 256]);	__syncthreads(); } 
-	if ((blockSize >= 256) && (tid < 128))  { sdata[tid] = minAngle(sdata[tid], sdata[tid + 128]);	__syncthreads(); } 
-	if ((blockSize >= 128) && (tid < 64))   { sdata[tid] = minAngle(sdata[tid], sdata[tid + 64]);	__syncthreads(); } 
+    /*//for each following lines, we have a reduction running whit log(n) threads
+	if ((blockSize >= 1024) && (tid < 512)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 512]);  __syncthreads(); }
+	if ((blockSize >= 512) && (tid < 256))  { sdata[tid] = minAngle(sdata[tid], sdata[tid + 256]);  __syncthreads(); }
+	if ((blockSize >= 256) && (tid < 128))  { sdata[tid] = minAngle(sdata[tid], sdata[tid + 128]);  __syncthreads(); }
+	if ((blockSize >= 128) && (tid < 64))   { sdata[tid] = minAngle(sdata[tid], sdata[tid + 64]);   __syncthreads(); }
+    if ((blockSize >= 64) && (tid < 32)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 32]);  __syncthreads(); }
+	if ((blockSize >= 32) && (tid < 16)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 16]);  __syncthreads(); }
+	if ((blockSize >= 16) && (tid < 8)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 8]);    __syncthreads(); }
+	if ((blockSize >= 8) && (tid < 4)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 4]);     __syncthreads(); }
+	if ((blockSize >= 4) && (tid < 2)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 2]);     __syncthreads(); }
+    if ((blockSize >= 2) && (tid < 1)) { sdata[tid] = minAngle(sdata[tid], sdata[tid + 1]);     __syncthreads(); }*/
     
-    if ((blockSize >= 64) && (tid < 32)) sdata[tid] = minAngle(sdata[tid], sdata[tid + 32]);
-	if ((blockSize >= 32) && (tid < 16)) sdata[tid] = minAngle(sdata[tid], sdata[tid + 16]);
-	if ((blockSize >= 16) && (tid < 8)) sdata[tid] = minAngle(sdata[tid], sdata[tid + 8]);
-	if ((blockSize >= 8) && (tid < 4)) sdata[tid] = minAngle(sdata[tid], sdata[tid + 4]);
-	if ((blockSize >= 4) && (tid < 2)) sdata[tid] = minAngle(sdata[tid], sdata[tid + 2]);
-	if ((blockSize >= 2) && (tid < 1)) sdata[tid] = minAngle(sdata[tid], sdata[tid + 1]);
+    unsigned int b_limit = BLKDIM;
+
+    //each cycle is a reduction step. it is completed in log2(BLKDIM), so in this case whit BLKDIM = 1024  --> the cycle runs 10 times
+    while (b_limit >= 2){
+        if ((blockSize >= b_limit) && (tid < b_limit/2)) { 
+            sdata[tid] = minAngle(sdata[tid], sdata[tid + b_limit/2]);
+            //printf( "b_limit= %d reduction phase between %d & %d: id %d has found a %f angle\n", b_limit, tid, tid+b_limit/2, tid, sdata[tid].a);
+            __syncthreads();
+        }
+        b_limit /= 2;
+    }
 
     if(tid == 0){ //array of result (each block return his best result)
         *out = sdata[0];	
     }
 }
 
-__global__ void reduce(const points_t *pset, cuda_point_t *temp, int *result, point_t prev, point_t cur){    //temp must have BLKDIM elements
+__global__ void reduce(const points_t *pset, cuda_point_t *temp, int *result, point_t prev, point_t cur){    //temp must have #blocks lenght
     const unsigned int tid = threadIdx.x;
     const unsigned int i = threadIdx.x + blockIdx.x * BLKDIM;
     __shared__ cuda_point_t sdata[BLKDIM];
 
     assert(gridDim.x < BLKDIM);
 
-    temp[tid].a = 2*M_PI;
+    temp[tid].a = 2*M_PI+1;
     temp[tid].id = -1;
-    sdata[tid].a = 2*M_PI;
+    sdata[tid].a = 2*M_PI+1;
     sdata[tid].id = -1;
     __syncthreads();
 
     if(i < pset->n){
         sdata[tid] = compute_angle(prev, cur, pset->p[i], i);
-        //if(tid==0) printf( "initial data: id %d has found a %f angle\n", i, sdata[tid].a);
         __syncthreads();
-        
-        
-        if( i <= (pset->n/2) ){
-            block_reduce(sdata, &temp[blockIdx.x], tid, BLKDIM);
-            __syncthreads();
-            //if(tid==0) printf( "1st phase: id %d has found a %f angle\n", i, temp[blockIdx.x].a);
-        }
+        //if(tid==0) printf( "initial data: id %d has found a %f angle\n", i, sdata[tid].a);  //this if for debug ####################################
 
+        block_reduce(sdata, &temp[blockIdx.x], tid, BLKDIM);
+        __syncthreads();
+        //if(tid==0) printf( "1st phase: id %d has found a %f angle\n", i, temp[blockIdx.x].a);   //this if for debug ####################################
+
+
+        //if we have more than BLKDIM blocks allocated --- Currently limited by hardcap before kernel call
+        /*if(gridDim.x > BLKDIM && i < gridDim.x ){
+            sdata[tid].a = 2*M_PI+1;
+            sdata[tid].id = -1;
+            if(i < gridDim.x) sdata[tid] = temp[i];
+            __syncthreads();
+
+            block_reduce(sdata, &temp[blockIdx.x], tid, BLKDIM); //gridDim.x 
+            __syncthreads();
+        }*/
+        
+        
         //if we have more than 1 block allocated
         if(i < BLKDIM && gridDim.x > 1){
-            sdata[tid].a = 2*M_PI;
+            sdata[tid].a = 2*M_PI+1;
             sdata[tid].id = -1;
             if(tid < gridDim.x) sdata[tid] = temp[tid];
             __syncthreads();
-            //if(tid==0) printf( "2nd phase: id %d has found a %f angle\n", i, sdata[tid].a);
-            block_reduce(sdata, &temp[0], tid, gridDim.x);  
+
+            block_reduce(sdata, &temp[0], tid, /*gridDim.x*/BLKDIM);  
             __syncthreads();
-            //if(tid==0) printf( "2nd phase: id %d has found a %f angle\n", i, sdata[tid].a);
+
+            //if(tid==0) printf( "2nd phase: id %d has found a %f angle\n", i, sdata[tid].a); //this if for debug ####################################
         }
 
+        //this extracts the result
         if(i == 0){
             *result = temp[0].id;
-            if(i==0) printf( "result is:  id= %d  angle= %f\n", temp[0].id, temp[0].a);
+            if(i==0) printf( "result is:  id= %d  angle= %f\n", temp[0].id, temp[0].a); //this if for debug ####################################
         }        
     }
 }
@@ -458,8 +491,6 @@ void convex_hull(const points_t *pset, points_t *hull)
     cudaSafeCall(   cudaMemcpy(&d_pset->n, &pset->n, sizeof(int), cudaMemcpyHostToDevice)   );
 
     cudaCheckError();
-
-
     
     /* Main loop of the Gift Wrapping algorithm. This is where most of
        the time is spent; therefore, this is the block of code that
@@ -472,21 +503,17 @@ void convex_hull(const points_t *pset, points_t *hull)
 
         //fprintf(stderr, "n. punti trovati: %d\n", hull->n);
 
-        //gestire memoria
         if(hull->n > 1){
             prev_p = hull->p[hull->n-2];
         }else{
-            prev_p = fakePoint;
+            prev_p = fakePoint; //used only for the first iteration
         }
 
         cur_p = hull->p[hull->n-1];
-
         
-        assert(blocks < 1024);
-
-        //print_debug_statements("debug point 2.1 - starting reduction\n");
+        assert(blocks < 1024);  //hard cap, could be a limitation
  
-        reduce<<<blocks, BLKDIM >>>(d_pset, temp_elem, d_result, prev_p, cur_p);    //temp must have blockNum elements
+        reduce<<<blocks, BLKDIM >>>(d_pset, temp_elem, d_result, prev_p, cur_p);    //temp_elem must have #blocks elements
         cudaDeviceSynchronize();
         cudaCheckError();
 
@@ -494,17 +521,21 @@ void convex_hull(const points_t *pset, points_t *hull)
         cudaSafeCall(   cudaMemcpy(&next, d_result, sizeof(int), cudaMemcpyDeviceToHost)    );
         cudaCheckError();
 
-        //print_debug_statements("debug point 2.4 - result grabbed succesfully\n");
         //fprintf(stderr, "debug point 2.5 - next = %d\n", next);
-        assert(next >= 0);
+
+        //if(hull->n >= n)break;
+        //break;
+
+        assert(next >= 0);  //if this is not true, the reduction is not working
         assert(cur != next);
         cur = next;
     } while (cur != leftmost);
 
     //free of gpu memory allocation
     //print_debug_statements("debug point 3.1 - deallocation of memory\n");
+    cudaFree(d_result);
+    cudaFree(temp_set);
     cudaFree(temp_elem);
-
     cudaFree(d_pset);
     
     /* Trim the excess space in the convex hull array */
