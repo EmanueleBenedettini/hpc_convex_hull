@@ -1,3 +1,5 @@
 .vs/
+MPI_Results/
+openMP_Results/
 *.hull
 *.png

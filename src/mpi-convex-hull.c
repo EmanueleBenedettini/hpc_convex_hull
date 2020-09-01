@@ -51,6 +51,7 @@
  *
  ****************************************************************************/
 #include "hpc.h"
+#include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -215,127 +216,115 @@ double cw_angle(const point_t p0, const point_t p1, const point_t p2)
 	return result;
 }
 
-/**
- * Swaps two points
- */
-void swap_points(point_t* p0, point_t* p1) {
-	if (p0->x != p1->x || p0->y != p1->y) {
-		point_t p;
-		p.x = p1->x;
-		p.y = p1->y;
-		p1->x = p0->x;
-		p1->y = p0->y;
-		p0->x = p.x;
-		p0->y = p.y;
-	}
-}
-
-
-/**
- * Reduction function
- * values and lenght, point array, last 2 point of hull
- */
-int reduction(int* vals, int lenght, point_t* p, int cur, point_t* last, point_t* scnd_last){
-	int res = vals[0];
-	double minAngle = 2*M_PI; //Greater than 180 degree = pi
-    for (int i = 0; i < lenght; i++) {
-		double angle = cw_angle(*scnd_last, *last, p[vals[i]]);	//i punti non sono giusti
-		if ((angle < minAngle) && (vals[i] != cur)) {
-			minAngle = angle;
-			res = vals[i];
-		}
-	}
-	return res;
-}
-
 
 /**
  * Compute the convex hull of all points in pset using the "Gift
  * Wrapping" algorithm. The vertices are stored in the hull data
  * structure, that does not need to be initialized by the caller.
  */
-void convex_hull(const points_t *pset, points_t *hull)
+void convex_hull(const points_t *pset, points_t *hull, int poolSize, int my_rank)
 {
     const int n = pset->n;
     point_t *p = pset->p;
-    point_t fakePoint;
+    point_t fakePoint, *last, *scnd_last;
     int i, j, running_condition;
-    int cur, next, leftmost;
+    int cur, next = 0, leftmost;
 
-    hull->n = 0;
+	int startIndex = (n/poolSize)*my_rank; 
+	int stopIndex = (n/poolSize)*(my_rank+1)-1;
+
+	if(my_rank == poolSize-1) stopIndex = n-1;
+
+	struct {double val; int idx} in, out;
+
+	MPI_Datatype MPI_point_t;
+  	MPI_Type_contiguous(2, MPI_DOUBLE, &MPI_point_t);
+  	MPI_Type_commit(&MPI_point_t);
+
+	hull->n = 0;
     /* There can be at most n points in the convex hull. At the end of
-       this function we trim the excess space. */
+    	this function we trim the excess space. */
     hull->p = (point_t*)malloc(n * sizeof(*(hull->p))); assert(hull->p);
     
-    /* Identify the leftmost point p[leftmost] */
-    leftmost = 0;
-    for (i = 1; i<n; i++) {
-        if (p[i].x < p[leftmost].x) {
-            leftmost = i;
-        }
-    }
-	/*
-	swap_points(&p[leftmost], &p[n-1]);
-	leftmost = n-1;*/
-    cur = leftmost;
+	if(my_rank == 0 ){
+    	/* Identify the leftmost point p[leftmost] */
+    	leftmost = 0;
+    	for (i = 1; i<n; i++) {
+        	if (p[i].x < p[leftmost].x) {
+            	leftmost = i;
+        	}
+    	}
 
-    fakePoint.x = p[leftmost].x;		//
-	fakePoint.y = p[leftmost].y - 1;	// This point is used for the first reduction operation that we will encounter
+	}
 
-	const int thread_count = omp_get_max_threads();
-    fprintf(stderr, "Thread count = %d\n", thread_count);
-	int tmpRes[thread_count];
+	//bradcast leftmost
+	MPI_Bcast(
+		&leftmost,	//buffer
+		1,		//count
+		MPI_INT,	//datatype
+		0,			//root process
+		MPI_COMM_WORLD	//comm
+		);
 
+	cur = leftmost;
 
+	if(next+1 == cur) next++;
+
+	fakePoint.x = p[leftmost].x;		// This point is used for the first reduction operation that we will encounter
+	fakePoint.y = p[leftmost].y - 1;	// 
+	
 /* Main loop of the Gift Wrapping algorithm. This is where most of
        the time is spent; therefore, this is the block of code that
-       must be parallelized. */
-#pragma omp parallel private(j) shared(cur, p, tmpRes, next, hull, leftmost, fakePoint, running_condition) default(none)
-{    
-	const int my_rank = omp_get_thread_num();
-    do {
-#pragma omp master
-{
+       must be parallelized. */   
+    do {		
         /* Add the current vertex to the hull */
         assert(hull->n < n);
         hull->p[hull->n] = p[cur];
         hull->n++;
 
-        /* Search for the next vertex */
-        //next = (cur + 1) % n;
+        /* Update the next vertex */
 		next++;
-}
-#pragma omp barrier
-		tmpRes[my_rank] = next;	//every thread updates his own next
 
-#pragma omp for schedule(static)
-        for (j=0; j<n; j++) {
-            if (LEFT == turn(p[cur], p[tmpRes[my_rank]], p[j]) && (j != tmpRes[my_rank] && j!= cur)) {
-                tmpRes[my_rank] = j;
+        for (j=startIndex; j<=stopIndex; j++) {
+            if (LEFT == turn(p[cur], p[next], p[j]) && (j != next && j!= cur)) {
+                next = j;
             }
         }
-#pragma omp barrier
-#pragma omp master
-{		
-		//extract the best suitable point from the array cotaining all of the threads best solutions
-		if(hull->n-2 >= 0){
-			next = reduction(tmpRes, thread_count, p, cur, &hull->p[hull->n-1], &hull->p[hull->n-2]);
-		}else{
-			next = reduction(tmpRes, thread_count, p, cur, &hull->p[hull->n-1], &fakePoint);
+
+		//fprintf(stderr, "Process %d has found angle id = %d\n", my_rank, tmpRes);
+
+		//these two variables are used during reduction.
+		last = &hull->p[hull->n-1];
+		if(hull->n == 1){
+			scnd_last = &fakePoint;
+		} else {
+			scnd_last = &hull->p[hull->n-2];
 		}
+		//once a thread has finished his part of the cycle
+		in.val = cw_angle(*scnd_last, *last, p[next]);
+		in.idx = next;
+
+		MPI_Allreduce(	&in,
+						&out,
+						1,
+						MPI_DOUBLE_INT,
+						MPI_MINLOC,
+						MPI_COMM_WORLD);
+
+		next = out.idx;
+
+		//fprintf(stderr, "Process %d Reduction has found angle id = %d\n", my_rank, next);
+
 		assert(cur != next); //if equals I'm stuck
         cur = next;
 		running_condition = (cur != leftmost);
 
-		/*this section moves points found to the beginning of the point array
-			so we can decrease the computational complexity in worst case scenario */
-		/*swap_points(&p[cur], &p[hull->n-1]);
-		next = hull->n-1;
-		cur = next;*/
-}
-#pragma omp barrier
+		//thees two variables are used during reduction.
+		last = &hull->p[hull->n-1];
+		scnd_last = &hull->p[hull->n-2];
+
+
     } while (running_condition);
-}  //END OF PARALLEL SECTION
 
     /* Trim the excess space in the convex hull array */
     hull->p = (point_t*)realloc(hull->p, (hull->n) * sizeof(*(hull->p)));
@@ -384,22 +373,75 @@ double hull_facet_area(const points_t *hull)
 	return length;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
+	MPI_Init( &argc, &argv);
+
+	MPI_Datatype MPI_point_t;
+  	MPI_Type_contiguous(2, MPI_DOUBLE, &MPI_point_t);
+  	MPI_Type_commit(&MPI_point_t);
+
+	//MPI setup
+	int my_rank, size;
+	
+	MPI_Comm_rank( MPI_COMM_WORLD, &my_rank );
+	MPI_Comm_size( MPI_COMM_WORLD, &size );
+
 	points_t pset, hull;
 	double tstart, elapsed;
+	int n_points;
 
-	read_input(stdin, &pset);
+	if(my_rank == 0){	//master
+
+		FILE *in = fopen(argv[1], "r");
+		if ( !in ) {
+            fprintf(stderr, "Cannot open %s for reading\n", argv[1]);
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+		read_input(in, &pset);
+		n_points = pset.n;
+		
+	}
+	//bradcast npoints to other process
+	MPI_Bcast(
+			&n_points,
+			1,
+			MPI_INT,
+			0,
+			MPI_COMM_WORLD
+			);
+
+	if(my_rank != 0){	//slaves
+		point_t *points = (point_t*)malloc(n_points * sizeof(*points));
+		pset.p = points;
+		pset.n = n_points;
+	}
+
+	//bradcast pset points
+	MPI_Bcast(
+		pset.p,
+		pset.n,
+		MPI_point_t,
+		0,
+		MPI_COMM_WORLD
+		);
+
 	tstart = hpc_gettime();
-	convex_hull(&pset, &hull);
+
+	convex_hull(&pset, &hull, size, my_rank);
+
 	elapsed = hpc_gettime() - tstart;
-	fprintf(stderr, "\nConvex hull of %d points in 2-d:\n\n", pset.n);
-	fprintf(stderr, "  Number of vertices: %d\n", hull.n);
-	fprintf(stderr, "  Total facet area: %f\n", hull_facet_area(&hull));
-	fprintf(stderr, "  Total volume: %f\n\n", hull_volume(&hull));
-	fprintf(stderr, "Elapsed time: %f\n\n", elapsed);
-	write_hull(stdout, &hull);
+
+	if(my_rank == 0){	//master
+		fprintf(stderr, "\nConvex hull of %d points in 2-d:\n\n", pset.n);
+		fprintf(stderr, "  Number of vertices: %d\n", hull.n);
+		fprintf(stderr, "  Total facet area: %f\n", hull_facet_area(&hull));
+		fprintf(stderr, "  Total volume: %f\n\n", hull_volume(&hull));
+		fprintf(stderr, "Elapsed time: %f\n\n", elapsed);
+		write_hull(stdout, &hull);
+	}
 	free_pointset(&pset);
 	free_pointset(&hull);
+	MPI_Finalize();
 	return EXIT_SUCCESS;
 }

@@ -10,6 +10,6 @@ do
 	#echo $hullName
 	#echo $pngName
 	
-	./cuda-convex-hull < $inputName > $hullName
+	mpirun -n 3 ./MPI-convex-hull $inputName > $hullName
 	gnuplot -c plot-hull.gp $inputName $hullName $pngName
 done
